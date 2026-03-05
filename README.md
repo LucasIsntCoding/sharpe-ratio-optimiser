@@ -1,4 +1,4 @@
-# Sharpe Ratio Optimizer
+# Sharpe Ratio Optimiser
 
 A technical Python implementation of a **mean-variance portfolio optimizer** that maximizes the **Sharpe ratio** using historical asset returns. This project combines Monte Carlo portfolio simulation with constrained numerical optimisation to identify the optimal long-only portfolio under realistic allocation constraints.
 
