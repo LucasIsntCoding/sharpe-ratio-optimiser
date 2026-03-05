@@ -1,0 +1,631 @@
+"""
+sharpe_ratio_optimizer.py
+
+A production-style mean-variance portfolio optimizer that maximizes the
+ex-ante Sharpe ratio under long-only constraints.
+
+Features
+--------
+1. Historical return estimation from price data (log or simple returns)
+2. Annualized expected return vector and covariance matrix estimation
+3. Random-search baseline using long-only simplex sampling (Dirichlet)
+4. Constrained nonlinear optimization using scipy.optimize (SLSQP)
+5. Global minimum variance portfolio
+6. Efficient frontier construction (minimum variance for target return)
+7. Visualization of simulated portfolios, efficient frontier, and optimal portfolio
+
+Mathematical Setup
+------------------
+Given:
+- mu    : annualized expected return vector, shape (n,)
+- Sigma : annualized covariance matrix, shape (n, n)
+- rf    : annualized risk-free rate
+- w     : portfolio weights, shape (n,)
+
+Portfolio metrics:
+- Expected return:    mu_p = w^T mu
+- Variance:           var_p = w^T Sigma w
+- Volatility:         sigma_p = sqrt(w^T Sigma w)
+- Sharpe ratio:       S(w) = (mu_p - rf) / sigma_p
+
+Optimization problem (long-only):
+    maximize_w   (w^T mu - rf) / sqrt(w^T Sigma w)
+    subject to   sum(w_i) = 1
+                 w_i in [0, 1]
+
+Efficient frontier:
+For each target return r*:
+    minimize_w   w^T Sigma w
+    subject to   sum(w_i) = 1
+                 w^T mu = r*
+                 w_i in [0, 1]
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, Any
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+
+
+@dataclass(frozen=True)
+class OptimizerConfig:
+    risk_free_rate: float = 0.02          # annualized
+    periods_per_year: int = 252
+    use_log_returns: bool = True
+    allow_short: bool = False             # project spec uses no short-selling
+    covariance_ridge: float = 1e-10       # numerical regularization
+    random_seed: int = 42
+
+
+class SharpeRatioOptimizer:
+    """
+    Mean-variance optimizer for maximizing the Sharpe ratio.
+    """
+
+    def __init__(self, prices: pd.DataFrame, config: Optional[OptimizerConfig] = None) -> None:
+        self.config = config or OptimizerConfig()
+        self.prices = self._validate_and_clean_prices(prices)
+        self.returns = self._compute_returns(self.prices, self.config.use_log_returns)
+
+        if self.returns.shape[0] < 2:
+            raise ValueError("Not enough return observations after preprocessing.")
+
+        self.asset_names = list(self.returns.columns)
+        self.n_assets = len(self.asset_names)
+
+        self.mu = self._estimate_annualized_mean(self.returns)
+        self.cov = self._estimate_annualized_covariance(self.returns)
+
+    # -------------------------------------------------------------------------
+    # Data validation / preprocessing
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _validate_and_clean_prices(prices: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(prices, pd.DataFrame):
+            raise TypeError("prices must be a pandas DataFrame.")
+
+        if prices.empty:
+            raise ValueError("prices DataFrame is empty.")
+
+        numeric_prices = prices.select_dtypes(include=[np.number]).copy()
+        if numeric_prices.shape[1] == 0:
+            raise ValueError("prices must contain at least one numeric asset column.")
+
+        # Sort by index, forward-fill missing values, then drop rows with any remaining NaNs.
+        numeric_prices = numeric_prices.sort_index().ffill().dropna(axis=0, how="any")
+
+        if numeric_prices.shape[0] < 2:
+            raise ValueError("Need at least two rows of price data after cleaning.")
+
+        if (numeric_prices <= 0).any().any():
+            raise ValueError("All prices must be strictly positive.")
+
+        # Drop constant-price assets (zero variance)
+        non_constant_cols = numeric_prices.nunique(dropna=True) > 1
+        numeric_prices = numeric_prices.loc[:, non_constant_cols]
+
+        if numeric_prices.shape[1] == 0:
+            raise ValueError("All asset columns are constant; cannot compute returns.")
+
+        return numeric_prices
+
+    @staticmethod
+    def _compute_returns(prices: pd.DataFrame, use_log_returns: bool = True) -> pd.DataFrame:
+        if use_log_returns:
+            rets = np.log(prices / prices.shift(1))
+        else:
+            rets = prices.pct_change()
+
+        rets = rets.replace([np.inf, -np.inf], np.nan).dropna(axis=0, how="any")
+
+        if rets.empty:
+            raise ValueError("Return matrix is empty after computing returns.")
+
+        return rets
+
+    def _estimate_annualized_mean(self, returns: pd.DataFrame) -> pd.Series:
+        return returns.mean() * self.config.periods_per_year
+
+    def _estimate_annualized_covariance(self, returns: pd.DataFrame) -> pd.DataFrame:
+        cov = returns.cov() * self.config.periods_per_year
+
+        # Ridge regularization for numerical stability
+        ridge = self.config.covariance_ridge
+        cov = cov + ridge * np.eye(cov.shape[0])
+
+        return cov
+
+    # -------------------------------------------------------------------------
+    # Internal numerical helpers
+    # -------------------------------------------------------------------------
+    def _bounds(self) -> Tuple[Tuple[float, float], ...]:
+        if self.config.allow_short:
+            # Example bounded shorting; adjust as needed.
+            return tuple((-1.0, 1.0) for _ in range(self.n_assets))
+        return tuple((0.0, 1.0) for _ in range(self.n_assets))
+
+    def _initial_weights(self) -> np.ndarray:
+        return np.full(self.n_assets, 1.0 / self.n_assets, dtype=float)
+
+    def _clean_weights(self, weights: np.ndarray) -> np.ndarray:
+        w = np.asarray(weights, dtype=float).copy()
+
+        if not self.config.allow_short:
+            # Remove tiny negative numerical artifacts
+            w = np.clip(w, 0.0, None)
+
+        total = w.sum()
+        if np.isclose(total, 0.0):
+            raise ValueError("Weight vector sums to zero after cleaning.")
+        w /= total
+        return w
+
+    def _weight_sum_constraint(self) -> Dict[str, Any]:
+        return {"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
+
+    # -------------------------------------------------------------------------
+    # Portfolio metrics
+    # -------------------------------------------------------------------------
+    def portfolio_metrics(self, weights: np.ndarray) -> Dict[str, float]:
+        w = np.asarray(weights, dtype=float)
+        mu_vec = self.mu.to_numpy()
+        cov_mat = self.cov.to_numpy()
+
+        portfolio_return = float(w @ mu_vec)
+        portfolio_variance = float(w @ cov_mat @ w)
+        portfolio_variance = max(portfolio_variance, 0.0)
+        portfolio_volatility = float(np.sqrt(portfolio_variance))
+
+        if portfolio_volatility <= 0.0:
+            sharpe = -np.inf
+        else:
+            sharpe = (portfolio_return - self.config.risk_free_rate) / portfolio_volatility
+
+        return {
+            "expected_return": portfolio_return,
+            "volatility": portfolio_volatility,
+            "sharpe_ratio": sharpe,
+        }
+
+    def _negative_sharpe(self, weights: np.ndarray) -> float:
+        metrics = self.portfolio_metrics(weights)
+        if not np.isfinite(metrics["sharpe_ratio"]):
+            return 1e12
+        return -metrics["sharpe_ratio"]
+
+    def _portfolio_variance(self, weights: np.ndarray) -> float:
+        w = np.asarray(weights, dtype=float)
+        cov_mat = self.cov.to_numpy()
+        value = float(w @ cov_mat @ w)
+        return max(value, 0.0)
+
+    # -------------------------------------------------------------------------
+    # Random-search baseline
+    # -------------------------------------------------------------------------
+    def random_search(self, n_portfolios: int = 100_000) -> pd.DataFrame:
+        """
+        Samples feasible long-only portfolios on the simplex using a Dirichlet distribution.
+        Returns a DataFrame of portfolio statistics and weights.
+        """
+        if n_portfolios <= 0:
+            raise ValueError("n_portfolios must be positive.")
+
+        if self.config.allow_short:
+            raise NotImplementedError(
+                "Random simplex sampling is implemented for long-only portfolios only."
+            )
+
+        rng = np.random.default_rng(self.config.random_seed)
+        weights = rng.dirichlet(alpha=np.ones(self.n_assets), size=n_portfolios)
+
+        mu_vec = self.mu.to_numpy()
+        cov_mat = self.cov.to_numpy()
+
+        portfolio_returns = weights @ mu_vec
+        portfolio_variances = np.einsum("ij,jk,ik->i", weights, cov_mat, weights)
+        portfolio_variances = np.maximum(portfolio_variances, 0.0)
+        portfolio_vols = np.sqrt(portfolio_variances)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sharpe = (portfolio_returns - self.config.risk_free_rate) / portfolio_vols
+            sharpe = np.where(np.isfinite(sharpe), sharpe, -np.inf)
+
+        results = pd.DataFrame({
+            "expected_return": portfolio_returns,
+            "volatility": portfolio_vols,
+            "sharpe_ratio": sharpe,
+        })
+
+        weight_cols = pd.DataFrame(weights, columns=[f"w_{name}" for name in self.asset_names])
+        return pd.concat([results, weight_cols], axis=1)
+
+    # -------------------------------------------------------------------------
+    # Optimization: maximum Sharpe ratio
+    # -------------------------------------------------------------------------
+    def optimize_max_sharpe(self, x0: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """
+        Solve the nonlinear Sharpe maximization problem via SLSQP.
+        """
+        x0 = self._initial_weights() if x0 is None else np.asarray(x0, dtype=float)
+        x0 = self._clean_weights(x0)
+
+        result = minimize(
+            fun=self._negative_sharpe,
+            x0=x0,
+            method="SLSQP",
+            bounds=self._bounds(),
+            constraints=[self._weight_sum_constraint()],
+            options={"maxiter": 2000, "ftol": 1e-12, "disp": False},
+        )
+
+        if not result.success:
+            raise RuntimeError(f"Max-Sharpe optimization failed: {result.message}")
+
+        weights = self._clean_weights(result.x)
+        metrics = self.portfolio_metrics(weights)
+
+        return {
+            "weights": pd.Series(weights, index=self.asset_names, name="weight"),
+            "metrics": metrics,
+            "scipy_result": result,
+        }
+
+    # -------------------------------------------------------------------------
+    # Optimization: minimum variance
+    # -------------------------------------------------------------------------
+    def optimize_min_variance(self, x0: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """
+        Global minimum variance portfolio under budget and bounds constraints.
+        """
+        x0 = self._initial_weights() if x0 is None else np.asarray(x0, dtype=float)
+        x0 = self._clean_weights(x0)
+
+        result = minimize(
+            fun=self._portfolio_variance,
+            x0=x0,
+            method="SLSQP",
+            bounds=self._bounds(),
+            constraints=[self._weight_sum_constraint()],
+            options={"maxiter": 2000, "ftol": 1e-12, "disp": False},
+        )
+
+        if not result.success:
+            raise RuntimeError(f"Minimum-variance optimization failed: {result.message}")
+
+        weights = self._clean_weights(result.x)
+        metrics = self.portfolio_metrics(weights)
+
+        return {
+            "weights": pd.Series(weights, index=self.asset_names, name="weight"),
+            "metrics": metrics,
+            "scipy_result": result,
+        }
+
+    # -------------------------------------------------------------------------
+    # Efficient frontier
+    # -------------------------------------------------------------------------
+    def optimize_min_variance_for_target_return(
+        self,
+        target_return: float,
+        x0: Optional[np.ndarray] = None
+    ) -> Dict[str, Any]:
+        """
+        Minimize portfolio variance subject to:
+            sum(w) = 1
+            w^T mu = target_return
+            bounds
+        """
+        x0 = self._initial_weights() if x0 is None else np.asarray(x0, dtype=float)
+        x0 = self._clean_weights(x0)
+
+        mu_vec = self.mu.to_numpy()
+
+        constraints = [
+            self._weight_sum_constraint(),
+            {"type": "eq", "fun": lambda w: float(w @ mu_vec) - float(target_return)},
+        ]
+
+        result = minimize(
+            fun=self._portfolio_variance,
+            x0=x0,
+            method="SLSQP",
+            bounds=self._bounds(),
+            constraints=constraints,
+            options={"maxiter": 3000, "ftol": 1e-12, "disp": False},
+        )
+
+        if not result.success:
+            raise RuntimeError(
+                f"Target-return frontier optimization failed at {target_return:.6f}: {result.message}"
+            )
+
+        weights = self._clean_weights(result.x)
+        metrics = self.portfolio_metrics(weights)
+
+        return {
+            "weights": pd.Series(weights, index=self.asset_names, name="weight"),
+            "metrics": metrics,
+            "target_return": target_return,
+            "scipy_result": result,
+        }
+
+    def efficient_frontier(self, n_points: int = 50) -> pd.DataFrame:
+        """
+        Construct the long-only efficient frontier by solving minimum-variance
+        problems across a grid of target returns.
+
+        Lower endpoint: return of the global minimum variance portfolio
+        Upper endpoint: max single-asset expected return (long-only feasible bound)
+        """
+        if n_points < 2:
+            raise ValueError("n_points must be at least 2.")
+
+        min_var_solution = self.optimize_min_variance()
+        min_var_return = min_var_solution["metrics"]["expected_return"]
+        upper_return = float(self.mu.max())
+
+        if upper_return < min_var_return:
+            # This should be rare, but guard against degenerate estimates.
+            upper_return = min_var_return
+
+        targets = np.linspace(min_var_return, upper_return, n_points)
+
+        frontier_rows = []
+        x0 = min_var_solution["weights"].to_numpy()
+
+        for target in targets:
+            try:
+                sol = self.optimize_min_variance_for_target_return(target_return=target, x0=x0)
+                x0 = sol["weights"].to_numpy()  # warm start next solve
+                row = {
+                    "target_return": target,
+                    "expected_return": sol["metrics"]["expected_return"],
+                    "volatility": sol["metrics"]["volatility"],
+                    "sharpe_ratio": sol["metrics"]["sharpe_ratio"],
+                }
+                for asset, weight in sol["weights"].items():
+                    row[f"w_{asset}"] = weight
+                frontier_rows.append(row)
+            except RuntimeError:
+                # Skip numerically infeasible points.
+                continue
+
+        if not frontier_rows:
+            raise RuntimeError("Efficient frontier construction failed for all target points.")
+
+        return pd.DataFrame(frontier_rows)
+
+    # -------------------------------------------------------------------------
+    # Reporting
+    # -------------------------------------------------------------------------
+    def asset_summary(self) -> pd.DataFrame:
+        """
+        Per-asset annualized return and volatility.
+        """
+        vol = np.sqrt(np.diag(self.cov.to_numpy()))
+        return pd.DataFrame({
+            "expected_return": self.mu,
+            "volatility": vol,
+        }, index=self.asset_names)
+
+    def summarize_solution(self, solution: Dict[str, Any], top_n: Optional[int] = None) -> pd.DataFrame:
+        """
+        Return sorted weight table with metrics attached as attrs.
+        """
+        weights = solution["weights"].sort_values(ascending=False)
+        if top_n is not None:
+            weights = weights.head(top_n)
+
+        summary = weights.to_frame(name="weight")
+        summary.attrs["metrics"] = solution["metrics"]
+        return summary
+
+    # -------------------------------------------------------------------------
+    # Visualization
+    # -------------------------------------------------------------------------
+    def plot(
+        self,
+        random_portfolios: Optional[pd.DataFrame] = None,
+        frontier: Optional[pd.DataFrame] = None,
+        optimal_solution: Optional[Dict[str, Any]] = None,
+        figsize: Tuple[int, int] = (11, 7),
+        show_assets: bool = True,
+    ) -> None:
+        """
+        Plot random portfolios, efficient frontier, and optimal solution.
+        """
+        plt.figure(figsize=figsize)
+
+        if random_portfolios is not None and not random_portfolios.empty:
+            sc = plt.scatter(
+                random_portfolios["volatility"],
+                random_portfolios["expected_return"],
+                c=random_portfolios["sharpe_ratio"],
+                alpha=0.35,
+                s=8,
+                cmap="viridis",
+                label="Random portfolios"
+            )
+            plt.colorbar(sc, label="Sharpe ratio")
+
+        if frontier is not None and not frontier.empty:
+            plt.plot(
+                frontier["volatility"],
+                frontier["expected_return"],
+                linewidth=2.2,
+                label="Efficient frontier"
+            )
+
+        if show_assets:
+            asset_stats = self.asset_summary()
+            plt.scatter(
+                asset_stats["volatility"],
+                asset_stats["expected_return"],
+                s=70,
+                marker="X",
+                label="Individual assets"
+            )
+            for asset, row in asset_stats.iterrows():
+                plt.annotate(asset, (row["volatility"], row["expected_return"]), xytext=(5, 4), textcoords="offset points")
+
+        if optimal_solution is not None:
+            m = optimal_solution["metrics"]
+            plt.scatter(
+                m["volatility"],
+                m["expected_return"],
+                s=220,
+                marker="*",
+                edgecolors="black",
+                linewidths=1.0,
+                label="Max Sharpe"
+            )
+
+        plt.xlabel("Annualized Volatility")
+        plt.ylabel("Annualized Expected Return")
+        plt.title("Mean-Variance Optimization: Efficient Frontier & Maximum Sharpe Portfolio")
+        plt.legend()
+        plt.grid(alpha=0.25)
+        plt.tight_layout()
+        plt.show()
+
+
+# -----------------------------------------------------------------------------
+# Utility functions
+# -----------------------------------------------------------------------------
+def load_prices_from_csv(
+    filepath: str,
+    date_column: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    Load a price matrix from CSV.
+
+    Expected format:
+    - one date column (optional)
+    - one column per asset containing strictly positive price levels
+    """
+    if date_column is None:
+        df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+    else:
+        df = pd.read_csv(filepath)
+        df[date_column] = pd.to_datetime(df[date_column])
+        df = df.set_index(date_column)
+
+    return df
+
+
+def generate_synthetic_prices(
+    n_assets: int = 5,
+    n_days: int = 756,   # ~3 years of trading days
+    seed: int = 7
+) -> pd.DataFrame:
+    """
+    Generate synthetic correlated geometric price paths for testing.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Annualized latent means and volatilities
+    annual_mu = rng.uniform(0.06, 0.18, size=n_assets)
+    annual_vol = rng.uniform(0.12, 0.35, size=n_assets)
+
+    # Random positive semidefinite correlation matrix
+    A = rng.normal(size=(n_assets, n_assets))
+    corr = np.corrcoef(A)
+    corr = 0.5 * (corr + corr.T)
+    np.fill_diagonal(corr, 1.0)
+
+    annual_cov = np.outer(annual_vol, annual_vol) * corr
+
+    daily_mu = annual_mu / 252.0
+    daily_cov = annual_cov / 252.0
+
+    daily_log_returns = rng.multivariate_normal(mean=daily_mu, cov=daily_cov, size=n_days)
+    log_price_paths = np.cumsum(daily_log_returns, axis=0)
+
+    start_prices = rng.uniform(80, 150, size=n_assets)
+    prices = start_prices * np.exp(log_price_paths)
+
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n_days)
+    cols = [f"Asset_{i+1}" for i in range(n_assets)]
+
+    return pd.DataFrame(prices, index=dates, columns=cols)
+
+
+# -----------------------------------------------------------------------------
+# Example workflow
+# -----------------------------------------------------------------------------
+def main() -> None:
+    # Replace this with your own CSV if you have real data:
+    # prices = load_prices_from_csv("prices.csv")
+    prices = generate_synthetic_prices(n_assets=6, n_days=900, seed=11)
+
+    config = OptimizerConfig(
+        risk_free_rate=0.03,     # 3% annualized
+        periods_per_year=252,
+        use_log_returns=True,
+        allow_short=False,
+        covariance_ridge=1e-10,
+        random_seed=123
+    )
+
+    optimizer = SharpeRatioOptimizer(prices=prices, config=config)
+
+    # Random-search baseline
+    random_portfolios = optimizer.random_search(n_portfolios=75_000)
+    best_random_idx = random_portfolios["sharpe_ratio"].idxmax()
+    best_random = random_portfolios.loc[best_random_idx]
+
+    # Gradient-based maximum Sharpe optimization
+    max_sharpe_solution = optimizer.optimize_max_sharpe()
+
+    # Global minimum variance portfolio
+    min_var_solution = optimizer.optimize_min_variance()
+
+    # Efficient frontier
+    frontier = optimizer.efficient_frontier(n_points=60)
+
+    # Reporting
+    print("\n" + "=" * 80)
+    print("ASSET SUMMARY (ANNUALIZED)")
+    print("=" * 80)
+    print(optimizer.asset_summary().round(6))
+
+    print("\n" + "=" * 80)
+    print("BEST RANDOM-SEARCH PORTFOLIO")
+    print("=" * 80)
+    print(best_random[["expected_return", "volatility", "sharpe_ratio"]].round(6))
+    random_weight_cols = [c for c in random_portfolios.columns if c.startswith("w_")]
+    random_weights = best_random[random_weight_cols].sort_values(ascending=False)
+    print("\nWeights:")
+    print(random_weights.round(6))
+
+    print("\n" + "=" * 80)
+    print("MAX-SHARPE OPTIMIZED PORTFOLIO (SLSQP)")
+    print("=" * 80)
+    print(pd.Series(max_sharpe_solution["metrics"]).round(6))
+    print("\nWeights:")
+    print(max_sharpe_solution["weights"].sort_values(ascending=False).round(6))
+
+    print("\n" + "=" * 80)
+    print("GLOBAL MINIMUM VARIANCE PORTFOLIO")
+    print("=" * 80)
+    print(pd.Series(min_var_solution["metrics"]).round(6))
+    print("\nWeights:")
+    print(min_var_solution["weights"].sort_values(ascending=False).round(6))
+
+    # Plot everything
+    optimizer.plot(
+        random_portfolios=random_portfolios,
+        frontier=frontier,
+        optimal_solution=max_sharpe_solution,
+        figsize=(12, 8),
+        show_assets=True
+    )
+
+
+if __name__ == "__main__":
+    main()
