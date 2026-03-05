@@ -1,29 +1,29 @@
 # Sharpe Ratio Optimizer
 
-A technical Python implementation of a **mean-variance portfolio optimizer** that maximizes the **Sharpe ratio** using historical asset returns. This project combines Monte Carlo portfolio simulation with constrained numerical optimization to identify the optimal long-only portfolio under realistic allocation constraints.
+A technical Python implementation of a **mean-variance portfolio optimizer** that maximizes the **Sharpe ratio** using historical asset returns. This project combines Monte Carlo portfolio simulation with constrained numerical optimisation to identify the optimal long-only portfolio under realistic allocation constraints.
 
 It includes:
 
 - historical return estimation from price data
-- annualized expected return and covariance estimation
+- annualised expected return and covariance estimation
 - random portfolio generation for baseline search
 - constrained Sharpe ratio maximization via `scipy.optimize`
 - global minimum variance portfolio construction
 - efficient frontier generation
-- portfolio visualization and risk-return analysis
+- portfolio visualisation and risk-return analysis
 
 ## Overview
 
-This project implements the core logic of **modern portfolio theory** in a practical, reproducible way. Given a set of historical asset prices, the optimizer computes:
+This project implements the core logic of **modern portfolio theory** in a practical, reproducible way. Given a set of historical asset prices, the optimiser computes:
 
-- expected annualized returns
-- annualized covariance matrix
+- expected annualised returns
+- annualised covariance matrix
 - portfolio return, volatility, and Sharpe ratio
 - the long-only portfolio with the maximum Sharpe ratio
 - the minimum-variance portfolio
 - the efficient frontier across feasible target returns
 
-The optimization is performed under the following constraints:
+The optimisation is performed under the following constraints:
 
 - portfolio weights sum to 1
 - no short-selling (`0 <= w_i <= 1`)
@@ -38,10 +38,10 @@ For a portfolio with weights `w`, expected return vector `mu`, covariance matrix
 - Portfolio volatility: `sigma_p = sqrt(w^T Sigma w)`
 - Sharpe ratio: `(mu_p - r_f) / sigma_p`
 
-The optimization problem is:
+The optimisation problem is:
 
 ```text
-maximize    (w^T mu - r_f) / sqrt(w^T Sigma w)
+maximise    (w^T mu - r_f) / sqrt(w^T Sigma w)
 
 subject to  sum(w_i) = 1
             0 <= w_i <= 1
@@ -55,20 +55,20 @@ The efficient frontier is constructed by solving a sequence of minimum-variance 
   - cleans and validates price data
   - supports log returns and simple returns
   - drops invalid and constant-price series
-  - applies covariance matrix ridge regularization for numerical stability
+  - applies covariance matrix ridge regularisation for numerical stability
 
 - **Monte Carlo baseline**
   - samples feasible long-only portfolios using a Dirichlet distribution
   - estimates return, volatility, and Sharpe ratio across thousands of portfolios
 
 - **Constrained optimization**
-  - uses **SLSQP** from `scipy.optimize`
+  - uses **SLSQP** from `scipy.optimise`
   - solves for:
     - maximum Sharpe ratio portfolio
     - global minimum variance portfolio
     - efficient frontier portfolios at target returns
 
-- **Visualization**
+- **Visualisation**
   - random portfolio cloud
   - Sharpe ratio color map
   - efficient frontier curve
@@ -79,7 +79,7 @@ The efficient frontier is constructed by solving a sequence of minimum-variance 
 
 ```text
 .
-├── sharpe_ratio_optimizer.py   # main optimizer implementation
+├── sharpe_ratio_optimiser.py   # main optimizer implementation
 ├── prices.csv                  # optional real price data input
 └── README.md
 ```
@@ -90,7 +90,7 @@ Clone the repository and install dependencies:
 
 ```bash
 git clone https://github.com/your-username/sharpe-ratio-optimizer.git
-cd sharpe-ratio-optimizer
+cd sharpe-ratio-optimiser
 pip install numpy pandas matplotlib scipy
 ```
 
@@ -115,7 +115,7 @@ python sharpe_ratio_optimizer.py
 This will:
 
 - generate correlated synthetic asset prices
-- estimate annualized return and covariance statistics
+- estimate annualised return and covariance statistics
 - run a large random portfolio search
 - compute the maximum Sharpe portfolio
 - compute the global minimum variance portfolio
@@ -128,7 +128,7 @@ Replace the synthetic data section in `main()` with a CSV load:
 
 ```python
 prices = load_prices_from_csv("prices.csv")
-optimizer = SharpeRatioOptimizer(prices=prices)
+optimiser = SharpeRatioOptimiser(prices=prices)
 ```
 
 Your CSV should contain:
@@ -151,11 +151,11 @@ Date,AAPL,MSFT,GOOGL,AMZN
 A typical workflow looks like this:
 
 ```python
-from sharpe_ratio_optimizer import SharpeRatioOptimizer, OptimizerConfig, load_prices_from_csv
+from sharpe_ratio_optimiser import SharpeRatioOptimiser, OptimiserConfig, load_prices_from_csv
 
 prices = load_prices_from_csv("prices.csv")
 
-config = OptimizerConfig(
+config = OptimiserConfig(
     risk_free_rate=0.03,
     periods_per_year=252,
     use_log_returns=True,
@@ -164,17 +164,17 @@ config = OptimizerConfig(
     random_seed=123
 )
 
-optimizer = SharpeRatioOptimizer(prices=prices, config=config)
+optimiser = SharpeRatioOptimiser(prices=prices, config=config)
 
-random_portfolios = optimizer.random_search(n_portfolios=50000)
-max_sharpe_solution = optimizer.optimize_max_sharpe()
-min_var_solution = optimizer.optimize_min_variance()
-frontier = optimizer.efficient_frontier(n_points=60)
+random_portfolios = optimiser.random_search(n_portfolios=50000)
+max_sharpe_solution = optimiser.optimise_max_sharpe()
+min_var_solution = optimiser.optimise_min_variance()
+frontier = optimiser.efficient_frontier(n_points=60)
 
 print(max_sharpe_solution["weights"])
 print(max_sharpe_solution["metrics"])
 
-optimizer.plot(
+optimiser.plot(
     random_portfolios=random_portfolios,
     frontier=frontier,
     optimal_solution=max_sharpe_solution
@@ -183,13 +183,13 @@ optimizer.plot(
 
 ## Output
 
-The optimizer returns structured portfolio results including:
+The optimiser returns structured portfolio results including:
 
-- optimized portfolio weights
-- expected annualized return
-- annualized volatility
+- optimised portfolio weights
+- expected annualised return
+- annualised volatility
 - Sharpe ratio
-- raw SciPy optimization output
+- raw SciPy optimisation output
 
 Example:
 
@@ -205,12 +205,12 @@ Example:
 }
 ```
 
-## Visualization
+## Visualisation
 
 The generated chart includes:
 
 - a scatter of random long-only portfolios
-- color-coded Sharpe ratios
+- colour-coded Sharpe ratios
 - the efficient frontier
 - the optimal maximum Sharpe portfolio
 - individual asset risk-return coordinates
@@ -218,15 +218,15 @@ The generated chart includes:
 This makes it easy to compare:
 
 - brute-force simulated allocations
-- numerically optimized allocations
+- numerically optimised allocations
 - the frontier of efficient risk-return combinations
 
 ## Configuration
 
-The optimizer is controlled through the `OptimizerConfig` dataclass:
+The optimiser is controlled through the `OptimiserConfig` dataclass:
 
 ```python
-OptimizerConfig(
+OptimiserConfig(
     risk_free_rate=0.02,
     periods_per_year=252,
     use_log_returns=True,
@@ -238,30 +238,30 @@ OptimizerConfig(
 
 ### Parameter Notes
 
-- `risk_free_rate`: annualized risk-free rate used in Sharpe ratio calculation
-- `periods_per_year`: trading periods used for annualization (`252` for daily data)
+- `risk_free_rate`: annualised risk-free rate used in Sharpe ratio calculation
+- `periods_per_year`: trading periods used for annualisation (`252` for daily data)
 - `use_log_returns`: whether to compute log returns instead of simple returns
 - `allow_short`: enables/disables short-selling bounds
-- `covariance_ridge`: small diagonal regularization term for numerical stability
+- `covariance_ridge`: small diagonal regularisation term for numerical stability
 - `random_seed`: ensures reproducible Monte Carlo sampling
 
 ## Why This Project Matters
 
-This project demonstrates the quantitative foundations of portfolio construction and risk-adjusted optimization. It is directly relevant to:
+This project demonstrates the quantitative foundations of portfolio construction and risk-adjusted optimisation. It is directly relevant to:
 
 - quantitative finance
 - portfolio analytics
 - asset allocation
-- risk modeling
+- risk modelling
 - systematic trading research
 
 It showcases practical use of:
 
-- vectorized numerical computing
+- vectorised numerical computing
 - covariance-based risk estimation
-- constrained nonlinear optimization
+- constrained nonlinear optimisation
 - simulation-based portfolio search
-- financial data engineering and visualization
+- financial data engineering and visualisation
 
 ## Possible Extensions
 
@@ -270,22 +270,8 @@ Future improvements could include:
 - Ledoit-Wolf covariance shrinkage
 - Black-Litterman return adjustment
 - transaction cost and turnover penalties
-- rolling-window walk-forward optimization
+- rolling-window walk-forward optimisation
 - out-of-sample performance backtesting
 - leverage constraints
 - sector or exposure constraints
 - downside-risk objectives such as Sortino ratio or CVaR optimization
-
-## Disclaimer
-
-This project is for educational and research purposes only. It is not financial advice and should not be used as the sole basis for investment decisions.
-
-## License
-
-This project is released under the MIT License. You may use, modify, and distribute it freely.
-
----
-
-### Author
-
-Built as a quantitative finance project focused on portfolio optimization, numerical methods, and risk-adjusted performance analysis.
